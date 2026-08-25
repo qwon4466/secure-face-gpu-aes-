@@ -42,6 +42,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from insightface.utils import face_align
 from utils.aes_crypto import decrypt_file
+from fastapi import UploadFile, File
 
 import torch  # GPU 메모리 및 컨텍스트 관리용 추가
 
@@ -82,7 +83,92 @@ def _init_db():
     conn.commit()
     conn.close()
 
+async def auto_recognize_logger():
+    """60초마다 카메라 화면을 분석하여 터미널에 유사도를 자동 출력하는 백그라운드 작업"""
+    print("\n🟢 [시스템] 60초 자동 분석 백그라운드 작업이 성공적으로 등록되었습니다!")
+    
+    while True:
+        await asyncio.sleep(60) # 60초 대기
+        print("\n⏰ [시스템] 60초 주기 도달! 카메라 얼굴 분석을 시도합니다...")
+        
+        # 1. 예외 처리 (어디서 막히는지 확인)
+        if camera is None:
+            print("❌ [오류] camera 객체가 생성되지 않았습니다.")
+            continue
+        if camera.detector is None or camera.recognizer is None:
+            print("❌ [오류] AI 모델(ArcFace)이 아직 로드되지 않았습니다.")
+            continue
+            
+        frame = camera.capture_raw_frame()
+        if frame is None:
+            print("❌ [오류] 카메라에서 영상을 받아오지 못했습니다. (카메라 연결 확인 필요)")
+            continue
+            
+        # 2. DB 확인
+        conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
+        rows = conn.execute("SELECT name, vector FROM users").fetchall()
+        conn.close()
+        
+        if not rows:
+            print("⚠️ [결과] DB에 등록된 사원이 없어서 비교할 수 없습니다.")
+            continue
 
+        # 3. 얼굴 탐지
+        bboxes, kpss = camera.detector.detect(frame, max_num=5, metric="default")
+        if bboxes is None or len(bboxes) == 0:
+            print("🔎 [결과] 현재 카메라 화면에 인식된 얼굴이 없습니다.")
+            continue
+            
+        # 4. 분석 결과 출력
+        print("\n" + "="*50)
+        print("🕒 [60초 자동 분석] 실시간 카메라 얼굴 인식 결과")
+        print("="*50)
+        
+        for i in range(len(bboxes)):
+            try:
+                lm = kpss[i]
+                aligned = face_align.norm_crop(frame, landmark=lm, image_size=112)
+                current_emb = camera.recognizer.get_feat(aligned)
+                
+                if current_emb is None:
+                    print(f"▶ 탐지된 얼굴 {i+1}: ⚠️ 특징점 추출 실패")
+                    continue
+                    
+                # 💡 핵심 수정 1: 연산 전 벡터를 1차원으로 확실하게 펴줌 (에러 방지)
+                current_emb = np.array(current_emb).flatten()
+                    
+                best_match_name = "알 수 없음"
+                best_score = 0.0
+                
+                for name, db_vector in rows:
+                    # 💡 핵심 수정 2: DB에서 가져온 벡터도 1차원으로 펴줌
+                    db_vector_flat = np.array(db_vector).flatten()
+                    
+                    # 0으로 나누는 에러 방지용 안전장치
+                    norm_curr = np.linalg.norm(current_emb)
+                    norm_db = np.linalg.norm(db_vector_flat)
+                    
+                    if norm_curr == 0 or norm_db == 0:
+                        continue
+                        
+                    similarity = float(np.dot(current_emb, db_vector_flat) / (norm_curr * norm_db))
+                    
+                    if similarity > best_score:
+                        best_score = similarity
+                        best_match_name = name
+                
+                threshold = 0.45
+                if best_score > threshold:
+                    print(f"▶ 탐지된 얼굴 {i+1}: ✅ [등록 사원] {best_match_name} (유사도: {best_score:.4f})")
+                else:
+                    print(f"▶ 탐지된 얼굴 {i+1}: ❌ [비허가자] (최고 유사도: {best_score:.4f})")
+                    
+            except Exception as e:
+                # 💡 에러가 나면 멈추지 않고 터미널에 원인을 출력
+                print(f"▶ 탐지된 얼굴 {i+1} 분석 중 에러 발생: {e}")
+                
+        print("="*50 + "\n")
+        
 # ── Lifespan (FastAPI 0.93+ 권장 방식) ───────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -105,9 +191,14 @@ async def lifespan(app: FastAPI):
     # 4. Recorder 초기화 및 시작
     recorder = PSFRecorder(camera, interval_sec=getattr(c, "RECORD_INTERVAL", 5))
     recorder.start()
-    
+
+    # 👇 여기에 이 한 줄을 추가하세요! (30초 타이머 시작) 👇
+    auto_logger_task = asyncio.create_task(auto_recognize_logger())
+
     yield  # --- 서버 가동 중 ---
     
+    auto_logger_task.cancel()
+
     # 5. 서버 종료 시 안전한 자원 해제
     if recorder:
         recorder.stop()
@@ -809,15 +900,20 @@ async def get_chunk_list():
 
 @app.post("/api/admin/verify_chunk")
 async def verify_chunk(folder_path: str = Form(...), password: str = Form(...)):
-    """관리자 비밀번호로 청크를 복호화하고 첫 프레임을 반환합니다."""
+    """관리자 비밀번호로 청크를 복호화하고 전체 동영상을 반환합니다."""
+    import subprocess
+    import shutil
+    
     enc_file = os.path.join(folder_path, "encrypted_raw.bin.enc")
     json_file = os.path.join(folder_path, "encrypted_raw.bin.json")
     
-    # 1. 파일 존재 여부 사전 검증 (에러 방지)
+    # 1. 파일 존재 여부 검증
     if not os.path.exists(enc_file) or not os.path.exists(json_file):
         raise HTTPException(status_code=404, detail="암호화된 파일이나 메타데이터를 찾을 수 없습니다.")
         
     temp_decrypted_bin = os.path.join(folder_path, "temp_admin_verify.bin")
+    temp_video = os.path.join(folder_path, "temp_raw_video.avi")
+    final_mp4 = os.path.join(folder_path, "restored_raw_video.mp4")
     
     # 2. AES-256 복호화 시도
     try:
@@ -827,39 +923,61 @@ async def verify_chunk(folder_path: str = Form(...), password: str = Form(...)):
             os.remove(temp_decrypted_bin)
         raise HTTPException(status_code=401, detail="복호화 실패: 비밀번호가 일치하지 않거나 파일이 손상되었습니다.")
         
-    # 3. 메타데이터 읽기 및 이미지 추출 (try-finally로 안전망 구축)
+    # 3. 메타데이터 읽기 및 동영상 렌더링
     try:
         with open(json_file, "r", encoding="utf-8") as f:
             meta = json.load(f)
         
-        width = meta["width"]
-        height = meta["height"]
+        width = meta.get("width", 640)
+        height = meta.get("height", 480)
         channels = meta.get("channels", 3)
+        fps = meta.get("fps", 10) # 저장 시 설정된 FPS
         frame_size = width * height * channels
         
+        # 비디오 라이터 생성 (AVI 임시 저장)
+        writer = cv2.VideoWriter(temp_video, cv2.VideoWriter_fourcc(*"MJPG"), fps, (width, height))
+        
         with open(temp_decrypted_bin, "rb") as f:
-            raw_data = f.read(frame_size)
+            while True:
+                # 💡 핵심: 1장만 읽는 게 아니라, 파일이 끝날 때까지 계속 읽음!
+                raw_data = f.read(frame_size)
+                if not raw_data or len(raw_data) != frame_size:
+                    break
+                
+                # 바이트를 이미지 배열로 변환하여 비디오에 추가
+                img_array = np.frombuffer(raw_data, dtype=np.uint8).reshape((height, width, channels))
+                writer.write(img_array)
+                
+        writer.release()
+        
+        # 브라우저 재생을 위해 FFmpeg로 MP4 변환
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg:
+            subprocess.run(
+                [ffmpeg, "-y", "-i", temp_video, "-vcodec", "libx264", "-pix_fmt", "yuv420p", final_mp4],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        else:
+            # FFmpeg가 없다면 꿩 대신 닭으로 AVI 반환
+            os.rename(temp_video, final_mp4)
             
     finally:
-        # 무조건 실행 보장: 에러가 나더라도 임시 복호화된 파일은 서버에 남지 않고 즉시 삭제됨
+        # 보안을 위해 임시 복호화된 .bin 원본 파일 즉시 삭제
         if os.path.exists(temp_decrypted_bin):
             os.remove(temp_decrypted_bin)
+        if os.path.exists(temp_video):
+            os.remove(temp_video)
             
-    # 4. 추출된 데이터 검증
-    if not raw_data or len(raw_data) != frame_size:
-        raise HTTPException(status_code=500, detail="프레임 데이터를 정상적으로 읽지 못했습니다.")
+    if not os.path.exists(final_mp4):
+        raise HTTPException(status_code=500, detail="동영상 렌더링에 실패했습니다.")
         
-    # 5. numpy 배열을 JPEG 이미지로 인코딩
-    img_array = np.frombuffer(raw_data, dtype=np.uint8).reshape((height, width, channels))
-    success, encoded_img = cv2.imencode('.jpg', img_array)
-    
-    if not success:
-        raise HTTPException(status_code=500, detail="이미지 렌더링에 실패했습니다.")
-        
-    # 성공 시 브라우저에 이미지 데이터 바로 스트리밍
-    return StreamingResponse(io.BytesIO(encoded_img.tobytes()), media_type="image/jpeg")
+    # 완성된 동영상 파일(.mp4)을 브라우저로 전송!
+    return FileResponse(final_mp4, media_type="video/mp4")
 
 # ── 직접 실행 ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+# 1.python main.py 실행
+# 2. 터미널 하나 더 열고,  ngrok http --domain=appointee-dreary-unisexual.ngrok-free.dev 8000 입력
+# 3. 주소창에 https://appointee-dreary-unisexual.ngrok-free.dev 입력
