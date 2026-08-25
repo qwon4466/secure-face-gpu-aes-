@@ -79,9 +79,9 @@
                     </div>
                 </div>
 
-                <div id="decryptStatus" style="font-weight: bold; margin-bottom: 16px; text-align: center; font-size: 15px;"></div>
+                <div id="decryptStatus" style="font-weight: bold; margin-bottom: 10px; text-align: center; font-size: 15px; height: 20px;"></div>
                 
-                <img id="decryptedFrame" style="max-width: 100%; max-height: 450px; width: auto; height: auto; object-fit: contain; border-radius: 8px; display: none; box-shadow: 0 4px 6px rgba(0,0,0,0.05); border: 1px solid #e2e8f0; margin: 0 auto;">
+                <video id="decryptedFrame" controls autoplay style="width: 100%; max-height: calc(100vh - 420px); object-fit: contain; border-radius: 8px; display: none; box-shadow: 0 4px 6px rgba(0,0,0,0.05); border: 1px solid #e2e8f0; margin: 0 auto; background: #000;"></video>
             </div>
         </div>
     </div>
@@ -155,8 +155,9 @@
                     const blob = await response.blob();
                     imgEl.src = URL.createObjectURL(blob);
                     imgEl.style.display = "block";
-                    statusEl.innerText = "✅ 원본 복호화 성공";
+                    statusEl.innerText = "";
                     statusEl.style.color = "#16a34a";
+
                 } else {
                     const err = await response.json();
                     statusEl.innerText = `❌ 에러: ${err.detail}`;
